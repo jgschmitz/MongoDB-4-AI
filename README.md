@@ -19,24 +19,26 @@ Build your orchestration layer — prompts, memory, and intent — in MongoDB. S
 ## Intelligence Layer Architecture
 
 ```mermaid
-graph TD
+graph LR
     subgraph Intelligence_Layer["Intelligence Layer (MongoDB)"]
-        M_Prompts["prompt_templates"]
-        M_Memory["session_memory"]
+        direction TB
         M_Intent["intent_registry"]
         M_Config["model_config"]
+        M_Prompts["prompt_templates"]
+        M_Memory["session_memory"]
         M_Context["context_chains"]
     end
 
     subgraph LLM_Tier["LLM Tier"]
+        direction TB
         GPT["OpenAI GPT-4o"]
         Claude["Anthropic Claude"]
         Llama["Llama 3 (self-hosted)"]
     end
 
+    M_Intent --> M_Prompts
     M_Prompts --> LLM_Tier
     M_Memory --> LLM_Tier
-    M_Intent --> M_Prompts
     M_Config --> LLM_Tier
     LLM_Tier -->|response + embeddings| M_Context
     M_Context --> M_Memory
