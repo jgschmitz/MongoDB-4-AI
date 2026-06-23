@@ -1,219 +1,473 @@
-"""
-MongoDB 4 AI — Intelligence Layer Orchestrator
-Resolves intent, loads prompt template, hydrates session memory, calls the active LLM.
+import time
+import json
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
 
-Usage:
-    python app.py --user usr_001 --query "Summarize the key risks in our Q4 report"
-    python app.py --user usr_001 --session sess_abc123 --query "What did we discuss earlier?"
-"""
-import os
-import argparse
-import uuid
-from datetime import datetime, timezone
+st.set_page_config(
+    page_title="MongoDB AI Brain Simulator",
+    page_icon="🧠",
+    layout="wide",
+)
 
-from dotenv import load_dotenv
-from pymongo import MongoClient
+MONGO_GREEN = "#00ED64"
+DARK = "#06110B"
+CARD = "#0D1F16"
+SOFT = "#E9FFF1"
 
-load_dotenv()
+st.markdown("""
+<style>
+.stApp {
+    background: linear-gradient(135deg, #06110B 0%, #0B1F16 45%, #020604 100%);
+}
 
-MONGODB_URI = os.getenv("MONGODB_URI")
-if not MONGODB_URI:
-    raise EnvironmentError("MONGODB_URI is not set. Copy .env.example to .env and fill in your Atlas connection string.")
+/* Only style our custom HTML, not every Streamlit element */
+.hero {
+    padding: 34px;
+    border-radius: 28px;
+    background: linear-gradient(135deg, rgba(0,237,100,.22), rgba(0,0,0,.35));
+    border: 1px solid rgba(0,237,100,.35);
+    box-shadow: 0 0 45px rgba(0,237,100,.18);
+    margin-bottom: 24px;
+}
 
-DB_NAME = os.getenv("MONGODB_DB", "ai_brain")
+.hero-title {
+    font-size: 56px;
+    font-weight: 900;
+    color: white;
+    line-height: 1;
+}
+
+.hero-sub {
+    margin-top: 16px;
+    font-size: 20px;
+    color: #C8FFD8;
+    max-width: 1050px;
+}
+
+.brain-card {
+    padding: 22px;
+    border-radius: 22px;
+    background: #0D1F16;
+    border: 1px solid rgba(0,237,100,.35);
+    box-shadow: 0 0 26px rgba(0,237,100,.12);
+    min-height: 170px;
+}
+
+.brain-title {
+    color: #00ED64;
+    font-size: 22px;
+    font-weight: 800;
+    margin-bottom: 8px;
+}
+
+.brain-body {
+    color: #E9FFF1;
+    font-size: 15px;
+}
+
+.pill {
+    display: inline-block;
+    padding: 6px 10px;
+    margin: 8px 5px 0 0;
+    border-radius: 999px;
+    color: #C8FFD8;
+    background: rgba(0,237,100,.12);
+    border: 1px solid rgba(0,237,100,.30);
+    font-size: 12px;
+}
+
+.pg-card {
+    padding: 18px;
+    border-radius: 18px;
+    background: #1F1111;
+    border: 1px solid rgba(255,80,80,.35);
+    min-height: 135px;
+}
+
+.pg-title {
+    color: #FF8080;
+    font-weight: 800;
+    font-size: 18px;
+}
+
+.pg-body {
+    color: #FFECEC;
+    font-size: 14px;
+}
+
+.big-number {
+    font-size: 54px;
+    font-weight: 900;
+    color: #00ED64;
+}
+
+.caption-green {
+    color: #C8FFD8;
+    font-size: 15px;
+}
+</style>
+""", unsafe_allow_html=True)
 
 
-# ---------------------------------------------------------------------------
-# MongoDB helpers
-# ---------------------------------------------------------------------------
-
-def get_db():
-    client = MongoClient(MONGODB_URI)
-    return client[DB_NAME], client
-
-
-def load_model_config(db) -> dict:
-    cfg = db["model_config"].find_one({"active": True})
-    if not cfg:
-        raise RuntimeError("No active model_config found. Run: python scripts/seed_collections.py")
-    return cfg
+def dark_plot(fig, height=450):
+    fig.update_layout(
+        template="plotly_dark",
+        height=height,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=SOFT),
+        margin=dict(l=30, r=30, t=50, b=30),
+    )
+    return fig
 
 
-def resolve_intent(db, query: str) -> dict:
-    """
-    Naive keyword-based intent resolution.
-    Replace with an embedding classifier or LLM-based router in production.
-    """
-    query_lower = query.lower()
-    intents = list(db["intent_registry"].find({}))
-    for intent in intents:
-        if any(kw in query_lower for kw in intent["label"].split("_")):
-            return intent
-    return intents[0] if intents else {}
-
-
-def load_prompt_template(db, template_id: str, model_key: str) -> str:
-    tmpl = db["prompt_templates"].find_one({"_id": template_id})
-    if not tmpl:
-        raise RuntimeError(f"Prompt template not found: {template_id}")
-    variants = tmpl.get("variants", {})
-    variant = variants.get(model_key) or next(iter(variants.values()))
-    return variant.get("user_template") or variant.get("prompt_template", "")
-
-
-def load_or_create_session(db, session_id: str | None, user_id: str, model: str) -> dict:
-    col = db["session_memory"]
-    if session_id:
-        session = col.find_one({"_id": session_id})
-        if session:
-            return session
-    new_session = {
-        "_id": f"sess_{uuid.uuid4().hex[:8]}",
-        "user_id": user_id,
-        "model": model,
-        "created_at": datetime.now(timezone.utc),
-        "last_active": datetime.now(timezone.utc),
-        "context_window_tokens": 0,
-        "turns": [],
-        "metadata": {}
-    }
-    col.insert_one(new_session)
-    return new_session
-
-
-def append_turn(db, session_id: str, role: str, content: str, tokens: int = 0):
-    col = db["session_memory"]
-    session = col.find_one({"_id": session_id})
-    turn_number = len(session.get("turns", [])) + 1
-    col.update_one(
-        {"_id": session_id},
-        {
-            "$push": {"turns": {
-                "turn": turn_number,
-                "role": role,
-                "content": content,
-                "timestamp": datetime.now(timezone.utc),
-                "tokens_used": tokens
-            }},
-            "$set": {"last_active": datetime.now(timezone.utc)},
-            "$inc": {"context_window_tokens": tokens}
+DOCUMENTS = {
+    "intent_registry": {
+        "_id": "intent_contract_review",
+        "label": "contract_review",
+        "description": "User wants to review, redline, or summarize a contract",
+        "confidence_threshold": 0.82,
+        "routing": {
+            "primary_model": "anthropic-claude-3-5",
+            "fallback_model": "openai-gpt-4o",
+            "prompt_template_id": "tmpl_contract_review_v2",
+            "tools_enabled": ["vector_search", "pdf_parser", "citation_extractor"]
+        },
+        "rag_config": {
+            "collection": "contract_embeddings",
+            "top_k": 8,
+            "similarity_metric": "cosine",
+            "min_score": 0.75
+        },
+        "guardrails": {
+            "pii_redaction": True,
+            "max_output_tokens": 4096,
+            "content_filter": "legal_safe"
         }
+    },
+    "prompt_templates": {
+        "_id": "tmpl_contract_review_v2",
+        "name": "contract_review",
+        "version": 2,
+        "variants": {
+            "openai-gpt-4o": {
+                "system": "You are a precise contract analyst.",
+                "user_template": "Review this contract and cite risky clauses: {{document}}"
+            },
+            "anthropic-claude-3-5": {
+                "system": "Analyze the contract for risk, obligation, and ambiguity.",
+                "user_template": "<contract>{{document}}</contract>"
+            },
+            "llama-3-70b": {
+                "prompt_template": "[INST] Review contract risk: {{document}} [/INST]"
+            }
+        },
+        "tags": ["contracts", "rag", "production"]
+    },
+    "model_config": {
+        "_id": "cfg_production_2026_q1",
+        "active": True,
+        "primary": {
+            "provider": "anthropic",
+            "model": "claude-3-5-sonnet",
+            "temperature": 0.2,
+            "max_tokens": 8192
+        },
+        "fallback": {
+            "provider": "openai",
+            "model": "gpt-4o",
+            "temperature": 0.2,
+            "max_tokens": 8192
+        },
+        "cost_controls": {
+            "monthly_budget_usd": 5000,
+            "per_request_cap_usd": 0.50,
+            "alert_threshold_pct": 80
+        }
+    },
+    "session_memory": {
+        "_id": "sess_a1b2c3d4",
+        "user_id": "usr_9912",
+        "model": "claude-3-5-sonnet",
+        "context_window_tokens": 8192,
+        "turns": [
+            {
+                "role": "user",
+                "content": "Review this contract for termination risk.",
+                "embedding_ref": "emb_001"
+            },
+            {
+                "role": "assistant",
+                "content": "The termination language gives the vendor broad discretion.",
+                "tokens_used": 312,
+                "embedding_ref": "emb_002"
+            }
+        ],
+        "metadata": {
+            "session_type": "contract_review",
+            "source_doc_ids": ["doc_msa_2026"],
+            "user_tier": "enterprise"
+        }
+    },
+    "feedback_loop": {
+        "_id": "eval_contract_review_2026_01",
+        "application": "contract_review_agent",
+        "success_criteria": {
+            "retrieval_relevance": 0.90,
+            "answer_correctness": 0.88,
+            "citation_quality": 0.92,
+            "task_completion": 0.85
+        },
+        "signals": [
+            "thumbs_up_down",
+            "human_review",
+            "citation_clicks",
+            "escalations",
+            "abandoned_sessions"
+        ],
+        "last_tuning_action": {
+            "changed": "rag_config.top_k",
+            "from": 5,
+            "to": 8,
+            "reason": "Improve recall on long contracts"
+        }
+    }
+}
+
+
+st.markdown("""
+<div class="hero">
+  <div class="hero-title">MongoDB AI Brain Simulator</div>
+  <div class="hero-sub">
+    Postgres stores records. MongoDB stores the intelligence layer:
+    prompts, memory, intent routing, model config, vector context, and feedback loops.
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Schema migrations", "0", "for model swaps")
+m2.metric("AI brain collections", "5", "native documents")
+m3.metric("Runtime changes", "Documents", "not deployments")
+m4.metric("Feedback loop", "Built in", "continuous tuning")
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "🧠 AI Brain Run",
+    "🍝 Postgres Pain",
+    "🍃 MongoDB Intelligence Layer",
+    "🚀 Model Evolution"
+])
+
+
+with tab1:
+    st.subheader("Watch an AI request move through the MongoDB brain")
+
+    user_prompt = st.text_input(
+        "User request",
+        value="Review this contract and identify termination risk."
     )
 
+    run = st.button("Run AI Brain Simulation", type="primary")
 
-def build_context_from_memory(session: dict) -> str:
-    turns = session.get("turns", [])
-    if not turns:
-        return ""
-    lines = []
-    for t in turns[-6:]:  # last 3 exchanges
-        lines.append(f"{t['role'].upper()}: {t['content']}")
-    return "\n".join(lines)
+    steps = [
+        ("Intent identified", "intent_registry", "contract_review detected with confidence 0.91"),
+        ("Prompt selected", "prompt_templates", "Loaded model-specific contract review prompt"),
+        ("Model config loaded", "model_config", "Primary: Claude 3.5 Sonnet. Fallback: GPT-4o"),
+        ("Memory hydrated", "session_memory", "Loaded prior user context and source documents"),
+        ("Vector context retrieved", "context_chains", "Top 8 relevant clauses retrieved with scores"),
+        ("Response generated", "LLM", "Answer generated with citations and risk ranking"),
+        ("Feedback captured", "feedback_loop", "Signal stored for future tuning"),
+    ]
+
+    if run:
+        progress = st.progress(0)
+        status_box = st.empty()
+
+        for i, (name, collection, detail) in enumerate(steps, start=1):
+            progress.progress(i / len(steps))
+            status_box.success(f"✓ {name}: {detail}")
+            time.sleep(0.35)
+
+        st.divider()
+        st.subheader("Generated response")
+
+        st.markdown(f"""
+        **Request:** {user_prompt}
+
+        **Answer:** The highest termination risk is the vendor's unilateral termination clause.
+        It allows termination with limited notice and does not clearly define cure rights.
+
+        **Why it matters:** In production, the app did not hard-code this behavior.
+        It loaded routing, prompts, model settings, memory, and feedback criteria from MongoDB documents.
+        """)
+
+        st.subheader("MongoDB document used during this step")
+        selected = st.selectbox("Inspect document", list(DOCUMENTS.keys()))
+        st.json(DOCUMENTS[selected])
+
+    else:
+        st.info("Click the button to simulate the AI brain runtime.")
 
 
-# ---------------------------------------------------------------------------
-# LLM dispatch
-# ---------------------------------------------------------------------------
+with tab2:
+    st.subheader("The relational version gets ugly fast")
 
-def call_openai(prompt: str, config: dict) -> tuple[str, int]:
-    from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    response = client.chat.completions.create(
-        model=config["model"],
-        temperature=config.get("temperature", 0.3),
-        max_tokens=config.get("max_tokens", 2048),
-        messages=[{"role": "user", "content": prompt}]
+    c1, c2, c3 = st.columns(3)
+
+    tables = [
+        ("prompt_templates", "Stores base prompt names"),
+        ("prompt_template_versions", "One row per version"),
+        ("prompt_model_variants", "One row per model-specific prompt shape"),
+        ("model_configs", "Provider, model, temperature, limits"),
+        ("routing_rules", "Intent-to-model routing"),
+        ("rag_configs", "Top-k, score thresholds, collections"),
+        ("memory_sessions", "Conversation session header"),
+        ("memory_turns", "One row per turn"),
+        ("feedback_events", "One row per signal"),
+    ]
+
+    for idx, (title, body) in enumerate(tables):
+        target_col = [c1, c2, c3][idx % 3]
+        target_col.markdown(f"""
+        <div class="pg-card">
+          <div class="pg-title">{title}</div>
+          <div class="pg-body">{body}<br><br>⚠ migration / join / deploy risk</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.divider()
+
+    df = pd.DataFrame({
+        "Change": [
+            "Add new model prompt shape",
+            "Add per-intent guardrails",
+            "Store variable memory turns",
+            "Add feedback signal",
+            "Change RAG strategy",
+            "Swap primary/fallback model"
+        ],
+        "Postgres impact": [
+            "New columns or variant tables",
+            "ALTER TABLE or new join table",
+            "Unbounded child rows",
+            "New event schema",
+            "Config table changes",
+            "Code + table update"
+        ],
+        "Operational drag": [8, 7, 6, 6, 7, 8]
+    })
+
+    fig = go.Figure(go.Bar(
+        x=df["Operational drag"],
+        y=df["Change"],
+        orientation="h",
+        text=df["Postgres impact"],
+        textposition="auto",
+    ))
+
+    fig.update_layout(
+        title="Relational drag as AI systems evolve",
+        xaxis_title="Pain level",
+        yaxis_title="",
     )
-    content = response.choices[0].message.content
-    tokens = response.usage.total_tokens
-    return content, tokens
+
+    st.plotly_chart(dark_plot(fig, 500), use_container_width=True)
 
 
-def call_anthropic(prompt: str, config: dict) -> tuple[str, int]:
-    import anthropic
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-    response = client.messages.create(
-        model=config["model"],
-        max_tokens=config.get("max_tokens", 2048),
-        messages=[{"role": "user", "content": prompt}]
+with tab3:
+    st.subheader("MongoDB stores the AI system as flexible documents")
+
+    c1, c2, c3 = st.columns(3)
+
+    cards = [
+        ("intent_registry", "Routes user intent to strategy, model, prompt, tools, RAG config, and guardrails.", ["routing", "tools", "guardrails"]),
+        ("prompt_templates", "Stores different prompt structures per model without schema changes.", ["OpenAI", "Claude", "Llama"]),
+        ("model_config", "Controls active model, fallback model, cost caps, temperature, and limits.", ["primary", "fallback", "budget"]),
+        ("session_memory", "Persists rolling conversation state, turns, metadata, and embeddings.", ["turns[]", "tokens", "metadata"]),
+        ("context_chains", "Tracks retrieved chunks, similarity scores, citations, and generated responses.", ["RAG", "vectors", "citations"]),
+        ("feedback_loop", "Stores evaluation metrics, user signals, human review, and tuning history.", ["evals", "signals", "tuning"]),
+    ]
+
+    for idx, (title, body, pills) in enumerate(cards):
+        target_col = [c1, c2, c3][idx % 3]
+        pill_html = "".join([f'<span class="pill">{p}</span>' for p in pills])
+        target_col.markdown(f"""
+        <div class="brain-card">
+          <div class="brain-title">{title}</div>
+          <div class="brain-body">{body}</div>
+          <br>
+          {pill_html}
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.divider()
+
+    selected = st.selectbox("Open a MongoDB document", list(DOCUMENTS.keys()))
+    st.json(DOCUMENTS[selected])
+
+
+with tab4:
+    st.subheader("Model evolution without schema migration drama")
+
+    before, after = st.columns(2)
+
+    with before:
+        st.markdown("### Before")
+        st.json(DOCUMENTS["model_config"])
+
+    updated_config = json.loads(json.dumps(DOCUMENTS["model_config"]))
+    updated_config["primary"] = {
+        "provider": "openai",
+        "model": "gpt-5",
+        "temperature": 0.2,
+        "max_tokens": 128000
+    }
+    updated_config["fallback"] = {
+        "provider": "anthropic",
+        "model": "claude-3-5-sonnet",
+        "temperature": 0.2,
+        "max_tokens": 8192
+    }
+    updated_config["effective_date"] = "2026-06-10T00:00:00Z"
+
+    with after:
+        st.markdown("### After")
+        st.json(updated_config)
+
+    st.divider()
+
+    a, b, c = st.columns(3)
+    a.markdown('<div class="big-number">0</div><div class="caption-green">DDL changes</div>', unsafe_allow_html=True)
+    b.markdown('<div class="big-number">0</div><div class="caption-green">schema migrations</div>', unsafe_allow_html=True)
+    c.markdown('<div class="big-number">1</div><div class="caption-green">document update</div>', unsafe_allow_html=True)
+
+    timeline = pd.DataFrame({
+        "Model": ["GPT-4", "Claude 3", "GPT-4o", "Voyage", "GPT-5", "Future Model"],
+        "MongoDB change": [1, 1, 1, 1, 1, 1],
+        "Postgres change": [4, 5, 6, 5, 8, 9],
+    })
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=timeline["Model"],
+        y=timeline["MongoDB change"],
+        mode="lines+markers",
+        name="MongoDB document updates",
+        line=dict(width=4)
+    ))
+    fig.add_trace(go.Scatter(
+        x=timeline["Model"],
+        y=timeline["Postgres change"],
+        mode="lines+markers",
+        name="Postgres schema/app changes",
+        line=dict(width=4)
+    ))
+
+    fig.update_layout(
+        title="AI model changes over time",
+        yaxis_title="Operational change required",
+        xaxis_title="",
     )
-    content = response.content[0].text
-    tokens = response.usage.input_tokens + response.usage.output_tokens
-    return content, tokens
 
-
-def call_llm(prompt: str, model_cfg: dict) -> tuple[str, int]:
-    primary = model_cfg["primary"]
-    provider = primary["provider"]
-    try:
-        if provider == "openai":
-            return call_openai(prompt, primary)
-        elif provider == "anthropic":
-            return call_anthropic(prompt, primary)
-        else:
-            raise ValueError(f"Unsupported provider: {provider}")
-    except Exception as e:
-        print(f"Primary model failed ({e}), trying fallback...")
-        fallback = model_cfg.get("fallback", {})
-        if fallback.get("provider") == "openai":
-            return call_openai(prompt, fallback)
-        elif fallback.get("provider") == "anthropic":
-            return call_anthropic(prompt, fallback)
-        raise
-
-
-# ---------------------------------------------------------------------------
-# Main orchestration loop
-# ---------------------------------------------------------------------------
-
-def run(user_id: str, query: str, session_id: str | None = None):
-    db, client = get_db()
-
-    model_cfg = load_model_config(db)
-    primary = model_cfg["primary"]
-    model_key = f"{primary['provider']}-{primary['model'].split('-')[0]}"
-
-    intent = resolve_intent(db, query)
-    template_id = intent.get("routing", {}).get("prompt_template_id", "")
-
-    session = load_or_create_session(db, session_id, user_id, primary["model"])
-    session_id = session["_id"]
-    print(f"Session  : {session_id}")
-    print(f"Intent   : {intent.get('label', 'unknown')}")
-    print(f"Model    : {primary['provider']} / {primary['model']}\n")
-
-    context = build_context_from_memory(session)
-    try:
-        template = load_prompt_template(db, template_id, model_key)
-        prompt = template.replace("{{document}}", query).replace("{{max_sentences}}", "5")
-    except Exception:
-        prompt = query
-
-    if context:
-        prompt = f"Previous conversation:\n{context}\n\n{prompt}"
-
-    append_turn(db, session_id, "user", query)
-
-    response, tokens = call_llm(prompt, model_cfg)
-
-    append_turn(db, session_id, "assistant", response, tokens)
-
-    print(f"Response ({tokens} tokens):\n")
-    print(response)
-
-    client.close()
-    return response
-
-
-def main():
-    parser = argparse.ArgumentParser(description="MongoDB AI Intelligence Layer")
-    parser.add_argument("--user", required=True, help="User ID")
-    parser.add_argument("--query", required=True, help="Natural language query")
-    parser.add_argument("--session", help="Existing session ID to continue")
-    args = parser.parse_args()
-
-    run(user_id=args.user, query=args.query, session_id=args.session)
-
-
-if __name__ == "__main__":
-    main()
+    st.plotly_chart(dark_plot(fig, 460), use_container_width=True)
